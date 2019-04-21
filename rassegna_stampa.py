@@ -3,12 +3,13 @@
 
 import time
 import random
-import datetime
+import datetime as dt
 from lxml import html
 import requests
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
-import urllib
+import urllib.parse
+import json
 
 URL = 'http://www.giornalone.it/quotidiani_italiani/'
 base_url = 'http://www.giornalone.it'
@@ -41,6 +42,7 @@ TOKEN = 'IL TOKEN'
 API_URL = 'https://api.telegram.org/bot%s' % (TOKEN)
 id_canale = 666
 id_mio = 666
+canali_rassegna = set([])
 GOOGLE_TRANSLATE = 1
 
 
@@ -93,7 +95,27 @@ def my_json_serialize(l):
 	for x in l:
 		big_string += '{"type": "photo", "media": "%s"},' % (x)
 	big_string = big_string[:-1] + ']'
-	return urllib.quote(big_string)
+	return urllib.parse.quote(big_string)
+
+def get_updates(current_time):
+	req_url = "{}/getUpdates".format(API_URL)
+	updates = json.loads(requests_retry_session().get(req_url).text)
+	updates = updates["result"]
+	for i, update in enumerate(updates):
+		message = update["message"]
+		if "entities" not in message:
+			del updates[i]
+			continue
+		
+		dont_delete = False
+		for entity in message["entities"]:
+			if entity["type"] == "bot_command":
+				dont_delete = True
+				break
+		if not dont_delete:
+			del updates[i]
+			continue
+	return updates
 
 def send_message(chat_id, text, markdown=False):
 	req_url = '%s/sendMessage?chat_id=%s&text=%s'\
@@ -114,7 +136,7 @@ def send_media_group(chat_id, media_group):
 
 def send_rassegna(chat_id, img_list, old_list):
 	send_message(chat_id, '*== RASSEGNA GIORNO %s ==*'\
-			% str(datetime.date.today()), True)
+			% str(dt.date.today()), True)
 	
 	# feature non voluta
 	# for old in old_list:
@@ -125,10 +147,9 @@ def send_rassegna(chat_id, img_list, old_list):
 	for i in range(0, len(img_list), 10):
 		send_media_group(chat_id, my_json_serialize(img_list[i:i+10]))
 
-def scarica_rassegna(test=False, proxy=None):
-	id_chat = id_canale
+def scarica_rassegna(id_chat, test=False, proxy=None):
 	if test:
-		id_chat = id_mio
+		id_chat = [id_mio]
 	
 	img_list = []
 	old_list = []
@@ -139,6 +160,7 @@ def scarica_rassegna(test=False, proxy=None):
 				get_proxy_url(url_giornale, proxy=proxy), headers=headers)
 		if giornale_response.status_code == 403:
 			send_message(id_mio, '403 FORBIDDEN DI %s' %(url_giornale))
+			continue
 		giornale_content = html.fromstring(giornale_response.content)
 		giornale_content = giornale_content.xpath('//div[@id="left"]')[0];
 		if len(giornale_content.\
@@ -153,38 +175,44 @@ def scarica_rassegna(test=False, proxy=None):
 		img_list.append(url_img)
 		time.sleep(5)
 	
-	send_rassegna(id_chat, img_list, old_list)
+	for chat in id_chat:
+		send_rassegna(chat, img_list, old_list)
 
 def main():
-	# SEMMAI un giorno riuscissi a far funzionare quest'obbrobbrio
-	# senza cron quello sara' un bel giorno visto che potro' implementare
-	# anche dei comandi tipo
-	orario_pubblicazione = datetime.time(7, 0, 0)
-	print('Orario pubblicazione: %02d:%02d:%02d' %(orario_pubblicazione.hour\
-			, orario_pubblicazione.minute, orario_pubblicazione.second))
-	
-	dt = datetime.datetime.now()
-	hour = dt.hour
-	minute = dt.minute
-	second = dt.second
-	if minute != 0 or second != 0:
-		time.sleep(60 - second)
-		time.sleep((60 - minute - 1)*60)
-		# mo l'orario dovrebbe essere un'ora piena, circa
-	
+	rassegna_fatta = False
+	orario_rassegna = 8
+	orario_rassegna -= 2 # differenza di orario, da modificare quando
+	# scatta l'ora legale/solare (non ho voglia di fare di meglio)
+	delta = 30
 	while True:
-		dt = datetime.datetime.now()
-		hour = dt.hour
-		minute = dt.minute
-		second = dt.second
-		
-		print('TICK: %02d:%02d:%02d' %(hour, minute, second))
-		if hour == orario_pubblicazione.hour:
-			scarica_rassegna(test=False, proxy=GOOGLE_TRANSLATE)
-		time.sleep(3600)
+		now = dt.datetime.utcnow()
+		epoch_now = time.time()
+		if now.hour == orario_rassegna and not rassegna_fatta:
+			scarica_rassegna(id_chat=canali_rassegna, test=False,\
+proxy=GOOGLE_TRANSLATE)
+			rassegna_fatta = True
+		if now.hour != orario_rassegna and rassegna_fatta:
+			rassegna_fatta = False
+		updates = get_updates(epoch_now)
+		for update in updates:
+			message = update["message"]
+			if abs(epoch_now - message["date"]) <= delta:
+				if message["text"].startswith("/rassegna"):
+					send_message(message["chat"]["id"], "Mo arrivo zzi'")
+					scarica_rassegna(id_chat=[message["chat"]["id"]],\
+test=False, proxy=GOOGLE_TRANSLATE)
+				elif message["text"].startswith("/aggiungi_questo_canale"):
+					canali_rassegna.add(message["chat"]["id"])
+					send_message(message["chat"]["id"], "Canale aggiunto.")
+				elif message["text"].startswith("/rimuovi_questo_canale"):
+					canali_rassegna.discard(message["chat"]["id"])
+					send_message(message["chat"]["id"], "Canale rimosso.")
+		print("Lista canali: {}".format(canali_rassegna))
+		time.sleep(delta)
 
 def test():
 	scarica_rassegna(test=True, proxy=GOOGLE_TRANSLATE)
 
 if __name__ == '__main__':
-	scarica_rassegna(test=False, proxy=GOOGLE_TRANSLATE)
+	# scarica_rassegna(test=False, proxy=GOOGLE_TRANSLATE, id_chat=[id_canale])
+	main()
